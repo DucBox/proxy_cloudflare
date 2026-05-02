@@ -7,6 +7,9 @@ const STT_PROXY_TOKEN = String(process.env.STT_PROXY_TOKEN || '').trim();
 const OPENAI_STT_UPSTREAM_URL = String(
   process.env.OPENAI_STT_UPSTREAM_URL || 'https://api.openai.com/v1/audio/transcriptions',
 ).trim();
+const OPENAI_RESPONSES_UPSTREAM_URL = String(
+  process.env.OPENAI_RESPONSES_UPSTREAM_URL || 'https://api.openai.com/v1/responses',
+).trim();
 const MAX_AUDIO_MB = Number(process.env.MAX_AUDIO_MB || 50);
 const MAX_AUDIO_BYTES = MAX_AUDIO_MB * 1024 * 1024;
 
@@ -34,6 +37,24 @@ function getBearerToken(req) {
   return match ? match[1].trim() : '';
 }
 
+function checkAuth(req, res) {
+  if (!STT_PROXY_TOKEN) return true;
+  if (getBearerToken(req) !== STT_PROXY_TOKEN) {
+    sendJson(res, 401, { error: 'Unauthorized' });
+    return false;
+  }
+  return true;
+}
+
+async function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
 async function readMultipart(req) {
   return await new Promise((resolve, reject) => {
     const fields = new Map();
@@ -43,22 +64,15 @@ async function readMultipart(req) {
 
     const busboy = new Busboy({
       headers: req.headers,
-      limits: {
-        files: 1,
-        fileSize: MAX_AUDIO_BYTES,
-      },
+      limits: { files: 1, fileSize: MAX_AUDIO_BYTES },
     });
 
-    busboy.on('field', (name, value) => {
-      fields.set(name, value);
-    });
+    busboy.on('field', (name, value) => fields.set(name, value));
 
     busboy.on('file', (fieldname, stream, filename, encoding, mimetype) => {
       fileMeta = { fieldname, filename, encoding, mimetype };
       stream.on('data', chunk => chunks.push(chunk));
-      stream.on('limit', () => {
-        fileTruncated = true;
-      });
+      stream.on('limit', () => { fileTruncated = true; });
     });
 
     busboy.on('filesLimit', () => {
@@ -76,20 +90,23 @@ async function readMultipart(req) {
         reject(Object.assign(new Error(`File quá lớn — tối đa ${MAX_AUDIO_MB}MB`), { statusCode: 413 }));
         return;
       }
-      resolve({
-        fields,
-        file: {
-          ...fileMeta,
-          buffer: Buffer.concat(chunks),
-        },
-      });
+      resolve({ fields, file: { ...fileMeta, buffer: Buffer.concat(chunks) } });
     });
 
     req.pipe(busboy);
   });
 }
 
-async function forwardToOpenAI({ fields, file }) {
+async function handleStt(req, res) {
+  const ct = String(req.headers['content-type'] || '');
+  if (!ct.includes('multipart/form-data')) {
+    sendJson(res, 415, { error: 'Expected multipart/form-data' });
+    return;
+  }
+
+  const payload = await readMultipart(req);
+  const { fields, file } = payload;
+
   const form = new FormData();
   const fileName = file.filename || 'audio.webm';
   const mimeType = file.mimetype || 'application/octet-stream';
@@ -100,21 +117,45 @@ async function forwardToOpenAI({ fields, file }) {
     if (value == null || value === '') continue;
     form.append(key, value);
   }
+  if (!fields.get('model')) form.append('model', 'gpt-4o-mini-transcribe');
+  if (!fields.get('response_format')) form.append('response_format', 'json');
 
-  if (!fields.get('model')) {
-    form.append('model', 'gpt-4o-mini-transcribe');
-  }
-  if (!fields.get('response_format')) {
-    form.append('response_format', 'json');
+  const upstream = await fetch(OPENAI_STT_UPSTREAM_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: form,
+  });
+
+  const responseText = await upstream.text();
+  res.writeHead(upstream.status, {
+    'Content-Type': upstream.headers.get('content-type') || 'application/json; charset=utf-8',
+  });
+  res.end(responseText);
+}
+
+async function handleResponses(req, res) {
+  const ct = String(req.headers['content-type'] || '');
+  if (!ct.includes('application/json')) {
+    sendJson(res, 415, { error: 'Expected application/json' });
+    return;
   }
 
-  return await fetch(OPENAI_STT_UPSTREAM_URL, {
+  const body = await readBody(req);
+
+  const upstream = await fetch(OPENAI_RESPONSES_UPSTREAM_URL, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
     },
-    body: form,
+    body,
   });
+
+  const responseText = await upstream.text();
+  res.writeHead(upstream.status, {
+    'Content-Type': upstream.headers.get('content-type') || 'application/json; charset=utf-8',
+  });
+  res.end(responseText);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -122,14 +163,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/health') {
       sendJson(res, 200, {
         ok: true,
-        service: 'stt-proxy',
-        upstream: OPENAI_STT_UPSTREAM_URL,
+        service: 'openai-proxy',
+        stt: OPENAI_STT_UPSTREAM_URL,
+        responses: OPENAI_RESPONSES_UPSTREAM_URL,
       });
-      return;
-    }
-
-    if (req.method !== 'POST' || req.url !== '/stt') {
-      sendJson(res, 404, { error: 'Not found' });
       return;
     }
 
@@ -138,31 +175,22 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (STT_PROXY_TOKEN) {
-      const token = getBearerToken(req);
-      if (token !== STT_PROXY_TOKEN) {
-        sendJson(res, 401, { error: 'Unauthorized' });
-        return;
-      }
-    }
+    if (!checkAuth(req, res)) return;
 
-    const ct = String(req.headers['content-type'] || '');
-    if (!ct.includes('multipart/form-data')) {
-      sendJson(res, 415, { error: 'Expected multipart/form-data' });
+    if (req.method === 'POST' && req.url === '/stt') {
+      await handleStt(req, res);
       return;
     }
 
-    const payload = await readMultipart(req);
-    const upstream = await forwardToOpenAI(payload);
-    const responseText = await upstream.text();
+    if (req.method === 'POST' && req.url === '/responses') {
+      await handleResponses(req, res);
+      return;
+    }
 
-    res.writeHead(upstream.status, {
-      'Content-Type': upstream.headers.get('content-type') || 'application/json; charset=utf-8',
-    });
-    res.end(responseText);
+    sendJson(res, 404, { error: 'Not found' });
   } catch (error) {
     const statusCode = Number(error?.statusCode || 500);
-    console.error('STT proxy error:', error);
+    console.error('Proxy error:', error);
     if (statusCode >= 400 && statusCode < 500) {
       sendJson(res, statusCode, { error: error.message || 'Bad request' });
       return;
@@ -172,5 +200,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`STT proxy listening on http://0.0.0.0:${PORT}`);
+  console.log(`OpenAI proxy listening on http://0.0.0.0:${PORT}`);
 });
